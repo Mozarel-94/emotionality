@@ -1,13 +1,14 @@
 import html
 import io
 import re
+from collections import Counter
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import streamlit as st
 from transformers import pipeline
 
 
-SUPPORTED_FILE_TYPES = (".txt", ".md")
+SUPPORTED_FILE_TYPES = (".txt", ".md", ".csv", ".json")
 MAX_SENTIMENT_CHARS = 1200
 MAX_CLASSIFICATION_CHARS = 1800
 MAX_FRAGMENT_CHARS = 400
@@ -74,7 +75,7 @@ def extract_text_from_upload(uploaded_file) -> str:
 
     file_name = uploaded_file.name.lower()
     if not file_name.endswith(SUPPORTED_FILE_TYPES):
-        raise ValueError("Неподдерживаемый тип файла. Загрузите файл в формате .txt или .md.")
+        raise ValueError("Неподдерживаемый тип файла. Загрузите файл в формате .txt, .md, .csv или .json.")
 
     file_bytes = uploaded_file.read()
     return io.BytesIO(file_bytes).read().decode("utf-8").strip()
@@ -362,14 +363,14 @@ def main() -> None:
 
     st.title("Анализ текста: тональность, эмоции и темы")
     st.write(
-        "Вставьте текст или загрузите один или несколько файлов `.txt` / `.md`. "
+        "Вставьте текст или загрузите один или несколько файлов `.txt` / `.md` / `.csv` / `.json`. "
         "Если файлы загружены, будет проанализировано их содержимое."
     )
 
     text_input = st.text_area("Введите текст", height=240, placeholder="Вставьте текст сюда...")
     uploaded_files = st.file_uploader(
         "Загрузите один или несколько файлов",
-        type=["txt", "md"],
+        type=["txt", "md", "csv", "json"],
         accept_multiple_files=True,
     )
 
