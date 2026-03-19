@@ -2,9 +2,15 @@
 import io
 import csv
 import json
+import os
 import re
 from collections import Counter
-from typing import Any, Dict, List, Optional, Sequence
+from html.parser import HTMLParser
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from urllib import error as urllib_error
+from urllib import parse as urllib_parse
+from urllib import request as urllib_request
+from xml.etree import ElementTree
 
 import altair as alt
 import streamlit as st
@@ -58,6 +64,29 @@ SENTIMENT_TRANSLATIONS = {
 Document = Dict[str, Any]
 AnalysisResult = Dict[str, Any]
 REVIEW_TEXT_KEYS = ("review", "text", "comment", "content", "message", "feedback", "body")
+DEFAULT_HTTP_TIMEOUT = 12
+MAX_SEARCH_RESULTS = 10
+MAX_SEARCH_QUERIES = 6
+MAX_PAGE_TEXT_CHARS = 6000
+SEARCH_RESULT_KEYS = ("organic", "organic_results", "results", "items")
+BLOCKED_SCHEMES = ("mailto:", "javascript:", "tel:")
+SEARCH_ENGINE_DOMAINS = (
+    "duckduckgo.com",
+    "www.duckduckgo.com",
+    "google.com",
+    "www.google.com",
+    "ya.ru",
+    "yandex.ru",
+    "www.yandex.ru",
+    "bing.com",
+    "www.bing.com",
+)
+ANTI_BOT_MARKERS = (
+    "Unfortunately, bots use DuckDuckGo too",
+    "anomaly-modal",
+    "Please complete the following challenge",
+)
+NEWSAPI_MAX_RESULTS = 100
 
 RUSSIAN_STOPWORDS = {
     "а", "без", "более", "был", "была", "были", "было", "быть", "в", "вам", "вас", "весь", "во",
@@ -277,6 +306,923 @@ def build_document(name: str, source_type: str, text: str, metadata: Optional[Di
     }
 
 
+class HTMLTextExtractor(HTMLParser):
+    """Извлекает текст и базовые мета-теги из HTML."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_script = False
+        self.in_style = False
+        self.in_title = False
+        self.text_parts: List[str] = []
+        self.title_parts: List[str] = []
+        self.meta: Dict[str, str] = {}
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        normalized_tag = tag.lower()
+        attrs_dict = {str(key).lower(): value for key, value in attrs}
+        if normalized_tag == "script":
+            self.in_script = True
+        elif normalized_tag == "style":
+            self.in_style = True
+        elif normalized_tag == "title":
+            self.in_title = True
+        elif normalized_tag == "meta":
+            meta_key = str(attrs_dict.get("property") or attrs_dict.get("name") or "").lower()
+            meta_content = str(attrs_dict.get("content") or "").strip()
+            if meta_key and meta_content:
+                self.meta[meta_key] = meta_content
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized_tag = tag.lower()
+        if normalized_tag == "script":
+            self.in_script = False
+        elif normalized_tag == "style":
+            self.in_style = False
+        elif normalized_tag == "title":
+            self.in_title = False
+
+    def handle_data(self, data: str) -> None:
+        if self.in_script or self.in_style:
+            return
+
+        cleaned = re.sub(r"\s+", " ", data).strip()
+        if not cleaned:
+            return
+
+        if self.in_title:
+            self.title_parts.append(cleaned)
+        self.text_parts.append(cleaned)
+
+
+class DuckDuckGoResultsParser(HTMLParser):
+    """Извлекает ссылки и сниппеты из HTML-выдачи DuckDuckGo."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.results: List[Dict[str, str]] = []
+        self.current_result: Optional[Dict[str, str]] = None
+        self.capture_title = False
+        self.capture_snippet = False
+        self.capture_source = False
+
+    def _flush_current_result(self) -> None:
+        if self.current_result and self.current_result.get("url"):
+            self.results.append(self.current_result)
+        self.current_result = None
+        self.capture_title = False
+        self.capture_snippet = False
+        self.capture_source = False
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        attrs_dict = {str(key).lower(): str(value or "") for key, value in attrs}
+        css_class = attrs_dict.get("class", "")
+
+        if tag.lower() == "a" and "result__a" in css_class:
+            href = attrs_dict.get("href", "").strip()
+            if href:
+                self._flush_current_result()
+                self.current_result = {"title": "", "url": href, "snippet": "", "source": ""}
+                self.capture_title = True
+        elif tag.lower() in ("a", "div", "span") and ("result__snippet" in css_class or "result__extras__url" in css_class):
+            if self.current_result:
+                if "result__snippet" in css_class:
+                    self.capture_snippet = True
+                if "result__extras__url" in css_class:
+                    self.capture_source = True
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized_tag = tag.lower()
+        if normalized_tag == "a" and self.capture_title:
+            self.capture_title = False
+        elif normalized_tag in ("a", "div", "span"):
+            self.capture_snippet = False
+            self.capture_source = False
+
+    def handle_data(self, data: str) -> None:
+        cleaned = re.sub(r"\s+", " ", data).strip()
+        if not cleaned or not self.current_result:
+            return
+
+        if self.capture_title:
+            self.current_result["title"] = f"{self.current_result['title']} {cleaned}".strip()
+        elif self.capture_snippet:
+            self.current_result["snippet"] = f"{self.current_result['snippet']} {cleaned}".strip()
+        elif self.capture_source:
+            self.current_result["source"] = f"{self.current_result['source']} {cleaned}".strip()
+
+
+def split_comma_lines(raw_value: str) -> List[str]:
+    """Разбивает ввод по запятым и строкам."""
+    if not raw_value.strip():
+        return []
+    values = [item.strip() for item in re.split(r"[\n,;]+", raw_value) if item.strip()]
+    return list(dict.fromkeys(values))
+
+
+def normalize_match_text(text: str) -> str:
+    """Готовит текст к поиску совпадений."""
+    lowered = text.lower().replace("ё", "е")
+    lowered = re.sub(r"[\"'`«»“”„]", " ", lowered)
+    lowered = re.sub(r"\s+", " ", lowered)
+    return lowered.strip()
+
+
+def build_search_queries(entity_name: str, aliases: List[str], extra_terms: List[str]) -> List[str]:
+    """Формирует набор поисковых запросов для поиска упоминаний."""
+    candidates = [entity_name.strip()] + [alias.strip() for alias in aliases if alias.strip()]
+    candidates = list(dict.fromkeys([candidate for candidate in candidates if candidate]))
+    query_suffix = " ".join(extra_terms[:3]).strip()
+    queries: List[str] = []
+
+    for candidate in candidates[:MAX_SEARCH_QUERIES]:
+        quoted = f"\"{candidate}\""
+        queries.append(f"{quoted} {query_suffix}".strip())
+        if query_suffix:
+            queries.append(candidate)
+
+    return list(dict.fromkeys(queries))[:MAX_SEARCH_QUERIES]
+
+
+def build_newsapi_query(entity_name: str, aliases: List[str]) -> str:
+    """Строит запрос для NewsAPI по названию юрлица и алиасам."""
+    main_name = entity_name.strip()
+    normalized_aliases = [alias.strip() for alias in aliases if alias.strip() and alias.strip().lower() != main_name.lower()]
+    if not main_name:
+        return ""
+
+    main_expr = f'"{main_name}"'
+    if not normalized_aliases:
+        return main_expr
+
+    alias_expr = " OR ".join(f'"{alias}"' for alias in normalized_aliases)
+    return f"{main_expr} OR ({alias_expr})"
+
+
+def extract_domain(url: str) -> str:
+    """Возвращает домен URL без www."""
+    try:
+        host = urllib_parse.urlparse(url).netloc.lower().strip()
+    except Exception:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def is_allowed_url(url: str, allowed_domains: List[str], blocked_domains: List[str]) -> bool:
+    """Проверяет, можно ли использовать URL для парсинга."""
+    normalized_url = url.strip().lower()
+    if not normalized_url or normalized_url.startswith(BLOCKED_SCHEMES):
+        return False
+
+    parsed = urllib_parse.urlparse(normalized_url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+
+    domain = extract_domain(normalized_url)
+    if not domain:
+        return False
+    if domain in SEARCH_ENGINE_DOMAINS:
+        return False
+
+    normalized_allowed = [item.lower() for item in allowed_domains if item.strip()]
+    normalized_blocked = [item.lower() for item in blocked_domains if item.strip()]
+
+    if any(domain == blocked or domain.endswith(f".{blocked}") for blocked in normalized_blocked):
+        return False
+    if normalized_allowed and not any(domain == allowed or domain.endswith(f".{allowed}") for allowed in normalized_allowed):
+        return False
+    return True
+
+
+def load_search_config() -> Dict[str, str]:
+    """Читает настройки поискового провайдера из переменных окружения."""
+    provider = os.getenv("SEARCH_PROVIDER", "auto").strip().lower() or "auto"
+    return {
+        "provider": provider,
+        "api_key": os.getenv("SEARCH_API_KEY", "").strip(),
+        "base_url": os.getenv("SEARCH_BASE_URL", "").strip(),
+    }
+
+
+def load_newsapi_config() -> Dict[str, str]:
+    """Читает настройки NewsAPI из переменных окружения."""
+    return {
+        "api_key": os.getenv("NEWSAPI_API_KEY", "435e8dcc837e438a9692120d1373b285").strip(),
+        "base_url": os.getenv("NEWSAPI_BASE_URL", "https://newsapi.org/v2/everything").strip() or "https://newsapi.org/v2/everything",
+    }
+
+
+def build_request(url: str, method: str = "GET", data: Optional[bytes] = None, headers: Optional[Dict[str, str]] = None):
+    """Создает HTTP-запрос с безопасным user-agent."""
+    request_headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; EmotionalityBot/1.0; +https://localhost)",
+        "Accept-Language": "ru,en;q=0.9",
+    }
+    if headers:
+        request_headers.update(headers)
+    return urllib_request.Request(url, data=data, headers=request_headers, method=method)
+
+
+def fetch_json(url: str, method: str = "GET", payload: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """Выполняет HTTP-запрос и возвращает JSON."""
+    body = None
+    request_headers = dict(headers or {})
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        request_headers.setdefault("Content-Type", "application/json")
+
+    request = build_request(url, method=method, data=body, headers=request_headers)
+    with urllib_request.urlopen(request, timeout=DEFAULT_HTTP_TIMEOUT) as response:
+        charset = response.headers.get_content_charset() or "utf-8"
+        raw_text = response.read().decode(charset, errors="replace")
+    parsed = json.loads(raw_text)
+    return parsed if isinstance(parsed, dict) else {"items": parsed}
+
+
+def fetch_url_text(url: str) -> str:
+    """Скачивает HTML как текст."""
+    request = build_request(url)
+    with urllib_request.urlopen(request, timeout=DEFAULT_HTTP_TIMEOUT) as response:
+        charset = response.headers.get_content_charset() or "utf-8"
+        return response.read().decode(charset, errors="replace")
+
+
+def is_anti_bot_page(text: str) -> bool:
+    """Определяет, что вместо выдачи пришла anti-bot страница."""
+    return any(marker in text for marker in ANTI_BOT_MARKERS)
+
+
+def parse_search_results(payload: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Нормализует ответ поискового провайдера."""
+    raw_results: List[Any] = []
+    for key in SEARCH_RESULT_KEYS:
+        if isinstance(payload.get(key), list):
+            raw_results = payload[key]
+            break
+    if not raw_results and isinstance(payload.get("data"), list):
+        raw_results = payload["data"]
+
+    results: List[Dict[str, str]] = []
+    for item in raw_results:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("link") or item.get("url") or "").strip()
+        if not url:
+            continue
+        title = str(item.get("title") or item.get("name") or "").strip()
+        snippet = str(item.get("snippet") or item.get("description") or item.get("text") or "").strip()
+        source_name = str(item.get("source") or item.get("displayed_link") or extract_domain(url)).strip()
+        results.append(
+            {
+                "title": title,
+                "url": url,
+                "snippet": snippet,
+                "source": source_name,
+            }
+        )
+    return results
+
+
+def parse_bing_rss_results(xml_text: str) -> List[Dict[str, str]]:
+    """Парсит RSS-выдачу Bing в единый формат результатов."""
+    results: List[Dict[str, str]] = []
+    try:
+        root = ElementTree.fromstring(xml_text)
+    except ElementTree.ParseError:
+        return results
+
+    channel = root.find("channel")
+    if channel is None:
+        return results
+
+    for item in channel.findall("item"):
+        title = (item.findtext("title") or "").strip()
+        url = (item.findtext("link") or "").strip()
+        snippet = (item.findtext("description") or "").strip()
+        if not url or not is_allowed_url(url, [], []):
+            continue
+        results.append(
+            {
+                "title": html.unescape(title),
+                "url": url,
+                "snippet": html.unescape(snippet),
+                "source": extract_domain(url),
+            }
+        )
+    return results
+
+
+def normalize_bing_result_url(url: str) -> str:
+    """Преобразует redirect-ссылку Bing в прямую внешнюю ссылку."""
+    cleaned = html.unescape(url.strip())
+    if not cleaned:
+        return ""
+
+    parsed = urllib_parse.urlparse(cleaned)
+    if "bing.com" not in parsed.netloc:
+        return cleaned
+
+    params = urllib_parse.parse_qs(parsed.query)
+    encoded_values = params.get("u", [])
+    if not encoded_values:
+        return cleaned
+
+    encoded = encoded_values[0]
+    if encoded.startswith("a1"):
+        encoded = encoded[2:]
+
+    padding = "=" * (-len(encoded) % 4)
+    try:
+        import base64
+
+        decoded = base64.urlsafe_b64decode(encoded + padding).decode("utf-8", errors="replace").strip()
+        return decoded or cleaned
+    except Exception:
+        return cleaned
+
+
+def parse_bing_html_results(html_text: str) -> List[Dict[str, str]]:
+    """Парсит обычную HTML-выдачу Bing."""
+    results: List[Dict[str, str]] = []
+    pattern = re.compile(
+        r'<li class="b_algo"[\s\S]*?<h2[^>]*><a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)</a></h2>[\s\S]*?(?:<div class="b_caption"><p[^>]*>([\s\S]*?)</p>)?',
+        re.IGNORECASE,
+    )
+    for raw_url, raw_title, raw_snippet in pattern.findall(html_text):
+        url = normalize_bing_result_url(raw_url)
+        title = re.sub(r"<[^>]+>", " ", raw_title)
+        snippet = re.sub(r"<[^>]+>", " ", raw_snippet or "")
+        title = re.sub(r"\s+", " ", html.unescape(title)).strip()
+        snippet = re.sub(r"\s+", " ", html.unescape(snippet)).strip()
+        if not url or not title:
+            continue
+        if not is_allowed_url(url, [], []):
+            continue
+        results.append(
+            {
+                "title": title,
+                "url": url,
+                "snippet": snippet,
+                "source": extract_domain(url),
+            }
+        )
+    return results
+
+
+def normalize_search_result_url(url: str) -> str:
+    """Преобразует URL поисковой выдачи в прямую ссылку."""
+    cleaned = html.unescape(url.strip())
+    if not cleaned:
+        return ""
+
+    parsed = urllib_parse.urlparse(cleaned)
+    if "duckduckgo.com" in parsed.netloc and parsed.path.startswith("/l/"):
+        params = urllib_parse.parse_qs(parsed.query)
+        uddg = params.get("uddg", [])
+        if uddg:
+            return urllib_parse.unquote(uddg[0]).strip()
+    return cleaned
+
+
+def parse_duckduckgo_html_results(html_text: str) -> List[Dict[str, str]]:
+    """Нормализует HTML-выдачу DuckDuckGo в список результатов поиска."""
+    parser = DuckDuckGoResultsParser()
+    parser.feed(html_text)
+    parser.close()
+    parser._flush_current_result()
+
+    results: List[Dict[str, str]] = []
+    for item in parser.results:
+        url = normalize_search_result_url(item.get("url", ""))
+        if not url:
+            continue
+        if not is_allowed_url(url, [], []):
+            continue
+        results.append(
+            {
+                "title": item.get("title", "").strip(),
+                "url": url,
+                "snippet": item.get("snippet", "").strip(),
+                "source": item.get("source", "").strip() or extract_domain(url),
+            }
+        )
+    if results:
+        return results
+
+    # Fallback для более простой HTML-выдачи, когда классы result__a/result__snippet отсутствуют.
+    generic_results: List[Dict[str, str]] = []
+    link_pattern = re.compile(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+    for href, raw_title in link_pattern.findall(html_text):
+        url = normalize_search_result_url(re.sub(r"\s+", " ", href))
+        title = re.sub(r"<[^>]+>", " ", raw_title)
+        title = re.sub(r"\s+", " ", html.unescape(title)).strip()
+        if not url or not title:
+            continue
+        if not is_allowed_url(url, [], []):
+            continue
+        generic_results.append(
+            {
+                "title": title,
+                "url": url,
+                "snippet": "",
+                "source": extract_domain(url),
+            }
+        )
+        if len(generic_results) >= MAX_SEARCH_RESULTS:
+            break
+    return generic_results
+
+
+def search_web_bing_rss(query: str, max_results: int, base_url: str = "") -> List[Dict[str, str]]:
+    """Ищет страницы через Bing RSS без API."""
+    endpoint = base_url or "https://www.bing.com/search"
+    params = urllib_parse.urlencode({"format": "rss", "q": query})
+    xml_text = fetch_url_text(f"{endpoint}?{params}")
+    return parse_bing_rss_results(xml_text)[:max_results]
+
+
+def search_web_bing_html(query: str, max_results: int, base_url: str = "") -> List[Dict[str, str]]:
+    """Ищет страницы через HTML-выдачу Bing без API."""
+    endpoint = base_url or "https://www.bing.com/search"
+    params = urllib_parse.urlencode({"q": query})
+    html_text = fetch_url_text(f"{endpoint}?{params}")
+    return parse_bing_html_results(html_text)[:max_results]
+
+
+def search_web_duckduckgo(query: str, max_results: int, base_url: str = "") -> List[Dict[str, str]]:
+    """Ищет страницы через HTML-выдачу DuckDuckGo."""
+    endpoint = base_url or "https://html.duckduckgo.com/html/"
+    params = urllib_parse.urlencode({"q": query, "kl": "ru-ru"})
+    html_text = fetch_url_text(f"{endpoint}?{params}")
+    if is_anti_bot_page(html_text):
+        return []
+    return parse_duckduckgo_html_results(html_text)[:max_results]
+
+
+def search_web(query: str, max_results: int) -> List[Dict[str, str]]:
+    """Ищет страницы через API или HTML-выдачу без API."""
+    search_config = load_search_config()
+    provider = search_config["provider"]
+    api_key = search_config["api_key"]
+    base_url = search_config["base_url"]
+
+    if provider in ("", "auto"):
+        provider = "auto"
+    elif not api_key and provider in ("serpapi", "serper"):
+        provider = "auto"
+
+    if provider == "serpapi":
+        endpoint = base_url or "https://serpapi.com/search.json"
+        params = urllib_parse.urlencode({"engine": "google", "q": query, "api_key": api_key, "num": max_results, "hl": "ru"})
+        payload = fetch_json(f"{endpoint}?{params}")
+    elif provider == "serper":
+        endpoint = base_url or "https://google.serper.dev/search"
+        payload = fetch_json(
+            endpoint,
+            method="POST",
+            payload={"q": query, "num": max_results, "gl": "ru", "hl": "ru"},
+            headers={"X-API-KEY": api_key},
+        )
+    elif provider == "bing_rss":
+        return search_web_bing_rss(query, max_results, base_url)
+    elif provider == "bing_html":
+        return search_web_bing_html(query, max_results, base_url)
+    elif provider == "duckduckgo_html":
+        return search_web_duckduckgo(query, max_results, base_url)
+    elif provider == "auto":
+        for fallback in (
+            lambda: search_web_bing_html(query, max_results),
+            lambda: search_web_bing_rss(query, max_results),
+            lambda: search_web_duckduckgo(query, max_results),
+        ):
+            try:
+                results = fallback()
+            except Exception:
+                results = []
+            if results:
+                return results
+        return []
+    else:
+        if not base_url:
+            raise ValueError("Для кастомного SEARCH_PROVIDER нужно задать SEARCH_BASE_URL.")
+        params = urllib_parse.urlencode({"q": query, "api_key": api_key, "num": max_results})
+        separator = "&" if "?" in base_url else "?"
+        payload = fetch_json(f"{base_url}{separator}{params}")
+
+    return parse_search_results(payload)
+
+
+def parse_html_page(html_text: str) -> Dict[str, str]:
+    """Извлекает заголовок, дату и текст из HTML."""
+    extractor = HTMLTextExtractor()
+    extractor.feed(html_text)
+    extractor.close()
+
+    title = " ".join(extractor.title_parts).strip()
+    meta_title = extractor.meta.get("og:title") or extractor.meta.get("twitter:title") or extractor.meta.get("title") or ""
+    if meta_title and len(meta_title) > len(title):
+        title = meta_title
+
+    description = extractor.meta.get("description") or extractor.meta.get("og:description") or extractor.meta.get("twitter:description") or ""
+    published_at = (
+        extractor.meta.get("article:published_time")
+        or extractor.meta.get("og:published_time")
+        or extractor.meta.get("publication_date")
+        or extractor.meta.get("pubdate")
+        or ""
+    )
+
+    raw_text = "\n".join(extractor.text_parts)
+    cleaned_text = re.sub(r"\s+", " ", raw_text)
+    cleaned_text = re.sub(r"(cookie|навигация|подписаться|войти|регистрация)(\s+\1)+", r"\1", cleaned_text, flags=re.IGNORECASE)
+    cleaned_text = cleaned_text.strip()[:MAX_PAGE_TEXT_CHARS]
+
+    return {
+        "title": title.strip(),
+        "description": description.strip(),
+        "published_at": published_at.strip(),
+        "text": cleaned_text,
+    }
+
+
+def find_matched_terms(text: str, terms: Sequence[str]) -> List[str]:
+    """Возвращает совпавшие термины из набора."""
+    normalized_text = normalize_match_text(text)
+    matched = []
+    for term in terms:
+        normalized_term = normalize_match_text(term)
+        if normalized_term and normalized_term in normalized_text:
+            matched.append(term.strip())
+    return list(dict.fromkeys(matched))
+
+
+def detect_supported_language(text: str) -> str:
+    """Грубо определяет, относится ли текст к русскому или английскому языку."""
+    sample = str(text or "").strip()[:2000]
+    if not sample:
+        return "unknown"
+
+    cyrillic_count = len(re.findall(r"[А-Яа-яЁё]", sample))
+    latin_count = len(re.findall(r"[A-Za-z]", sample))
+    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", sample))
+
+    if cjk_count and cjk_count >= max(cyrillic_count, latin_count):
+        return "other"
+    if cyrillic_count >= max(8, latin_count):
+        return "ru"
+    if latin_count >= max(8, cyrillic_count):
+        return "en"
+    if cyrillic_count > 0 and latin_count > 0:
+        return "mixed"
+    return "unknown"
+
+
+def evaluate_entity_match(
+    entity_name: str,
+    aliases: List[str],
+    extra_terms: List[str],
+    page_title: str,
+    page_text: str,
+    snippet: str,
+    domain: str,
+    allowed_domains: List[str],
+) -> Tuple[str, List[str], str]:
+    """Определяет релевантность страницы к указанному юрлицу."""
+    base_terms = [entity_name] + aliases
+    combined_text = " ".join([page_title, snippet, page_text, domain]).strip()
+    language = detect_supported_language(" ".join([page_title, snippet, page_text]))
+    if language not in ("ru", "en", "mixed"):
+        return "rejected", [], language
+
+    matched_terms = find_matched_terms(combined_text, base_terms)
+    matched_extra = find_matched_terms(combined_text, extra_terms)
+
+    score = 0
+    if matched_terms:
+        score += 2
+    if entity_name.strip() and entity_name.strip() in matched_terms:
+        score += 2
+    if matched_extra:
+        score += 1
+    if allowed_domains and any(domain == allowed or domain.endswith(f".{allowed}") for allowed in allowed_domains):
+        score += 1
+
+    if not matched_terms:
+        return "rejected", matched_extra, language
+    if score >= 4:
+        return "relevant", matched_terms + matched_extra, language
+    return "possible", matched_terms + matched_extra, language
+
+
+def build_internet_document(
+    entity_name: str,
+    search_query: str,
+    search_result: Dict[str, str],
+    page_payload: Dict[str, str],
+    match_status: str,
+    matched_terms: List[str],
+    language: str = "unknown",
+    fetch_error: str = "",
+) -> Document:
+    """Нормализует интернет-упоминание в текущий формат документа."""
+    url = search_result.get("url", "")
+    domain = extract_domain(url)
+    page_title = page_payload.get("title", "").strip() or search_result.get("title", "").strip()
+    page_text = page_payload.get("text", "").strip()
+    text = page_text or " ".join(
+        part for part in [page_title, page_payload.get("description", ""), search_result.get("snippet", "")]
+        if part.strip()
+    )
+    return build_document(
+        page_title or f"Упоминание: {entity_name}",
+        "internet_mention",
+        text,
+        metadata={
+            "format": "internet",
+            "entity_name": entity_name,
+            "url": url,
+            "domain": domain,
+            "search_query": search_query,
+            "search_title": search_result.get("title", "").strip(),
+            "search_snippet": search_result.get("snippet", "").strip(),
+            "published_at": page_payload.get("published_at", "").strip(),
+            "match_status": match_status,
+            "matched_terms": matched_terms,
+            "language": language,
+            "fetch_error": fetch_error,
+        },
+    )
+
+
+def build_news_document(
+    entity_name: str,
+    query: str,
+    article: Dict[str, Any],
+    match_status: str,
+    matched_terms: List[str],
+    language: str,
+) -> Document:
+    """Нормализует новостную статью в документ для анализа."""
+    source_data = article.get("source", {}) if isinstance(article.get("source"), dict) else {}
+    title = str(article.get("title", "") or "").strip()
+    description = str(article.get("description", "") or "").strip()
+    content = str(article.get("content", "") or "").strip()
+    url = str(article.get("url", "") or "").strip()
+    source_name = str(source_data.get("name", "") or "").strip() or extract_domain(url) or "Новостной источник"
+    full_text = "\n".join(part for part in [title, description, content] if part)
+    return build_document(
+        title or f"Новость: {entity_name}",
+        "news_mention",
+        full_text,
+        metadata={
+            "format": "newsapi",
+            "entity_name": entity_name,
+            "url": url,
+            "domain": extract_domain(url),
+            "source_name": source_name,
+            "author": str(article.get("author", "") or "").strip(),
+            "published_at": str(article.get("publishedAt", "") or "").strip(),
+            "language": language,
+            "query": query,
+            "match_status": match_status,
+            "matched_terms": matched_terms,
+            "search_title": title,
+            "search_snippet": description,
+        },
+    )
+
+
+def fetch_newsapi_articles(news_params: Dict[str, Any]) -> Dict[str, Any]:
+    """Получает статьи из NewsAPI."""
+    news_config = load_newsapi_config()
+    api_key = news_config["api_key"]
+    base_url = news_config["base_url"]
+    if not api_key:
+        raise ValueError("Не задан NEWSAPI_API_KEY. Добавьте ключ NewsAPI в переменные окружения.")
+
+    query = build_newsapi_query(str(news_params.get("entity_name", "")), list(news_params.get("aliases", [])))
+    if not query:
+        raise ValueError("Укажите юридическое лицо для поиска новостей.")
+
+    max_results = min(max(int(news_params.get("max_results", 10)), 1), NEWSAPI_MAX_RESULTS)
+    query_params: Dict[str, Any] = {
+        "q": query,
+        "pageSize": max_results,
+        "sortBy": "publishedAt",
+    }
+    language = str(news_params.get("language", "") or "").strip().lower()
+    if language in ("ru", "en"):
+        query_params["language"] = language
+    date_from = str(news_params.get("date_from", "") or "").strip()
+    date_to = str(news_params.get("date_to", "") or "").strip()
+    if date_from:
+        query_params["from"] = date_from
+    if date_to:
+        query_params["to"] = date_to
+
+    params = urllib_parse.urlencode(query_params)
+    payload = fetch_json(
+        f"{base_url}?{params}",
+        headers={"X-Api-Key": api_key},
+    )
+    if payload.get("status") == "error":
+        raise ValueError(str(payload.get("message") or "NewsAPI вернул ошибку."))
+    return payload
+
+
+def collect_news_mentions(news_params: Dict[str, Any]) -> Tuple[List[Document], Dict[str, Any]]:
+    """Ищет новости о юрлице через NewsAPI."""
+    entity_name = str(news_params.get("entity_name", "")).strip()
+    aliases = list(news_params.get("aliases", []))
+    extra_terms = list(news_params.get("extra_terms", []))
+    allowed_sources = [item.lower() for item in news_params.get("allowed_sources", []) if str(item).strip()]
+    query = build_newsapi_query(entity_name, aliases)
+    report: Dict[str, Any] = {
+        "report_type": "news",
+        "entity_name": entity_name,
+        "queries": [query] if query else [],
+        "search_errors": [],
+        "fetch_errors": [],
+        "rejected_pages": [],
+        "possible_pages": [],
+        "found_urls": 0,
+        "parsed_urls": 0,
+        "relevant_count": 0,
+        "possible_count": 0,
+        "rejected_count": 0,
+        "source_stats": {},
+    }
+
+    if not entity_name:
+        raise ValueError("Укажите юридическое лицо для поиска новостей.")
+
+    payload = fetch_newsapi_articles(news_params)
+    articles = payload.get("articles", [])
+    if not isinstance(articles, list):
+        articles = []
+    report["found_urls"] = len(articles)
+
+    documents: List[Document] = []
+    source_counter: Counter[str] = Counter()
+    for article in articles:
+        if not isinstance(article, dict):
+            continue
+        source_data = article.get("source", {}) if isinstance(article.get("source"), dict) else {}
+        source_name = str(source_data.get("name", "") or "").strip()
+        source_id = str(source_data.get("id", "") or "").strip().lower()
+        if allowed_sources and not any(candidate in allowed_sources for candidate in [source_id, source_name.lower()]):
+            continue
+
+        title = str(article.get("title", "") or "").strip()
+        description = str(article.get("description", "") or "").strip()
+        content = str(article.get("content", "") or "").strip()
+        article_text = "\n".join(part for part in [title, description, content] if part)
+        report["parsed_urls"] += 1
+
+        match_status, matched_terms, language = evaluate_entity_match(
+            entity_name,
+            aliases,
+            extra_terms,
+            title,
+            article_text,
+            description,
+            extract_domain(str(article.get("url", "") or "")),
+            [],
+        )
+        document = build_news_document(entity_name, query, article, match_status, matched_terms, language)
+
+        if source_name:
+            source_counter[source_name] += 1
+
+        if match_status == "relevant":
+            report["relevant_count"] += 1
+            documents.append(document)
+        elif match_status == "possible":
+            report["possible_count"] += 1
+            report["possible_pages"].append(document["metadata"])
+            documents.append(document)
+        else:
+            report["rejected_count"] += 1
+            report["rejected_pages"].append(document["metadata"])
+
+    report["source_stats"] = dict(source_counter.most_common(5))
+    return documents, report
+
+
+def collect_internet_mentions(search_params: Dict[str, Any]) -> Tuple[List[Document], Dict[str, Any]]:
+    """Ищет и парсит интернет-упоминания юрлица."""
+    entity_name = str(search_params.get("entity_name", "")).strip()
+    aliases = list(search_params.get("aliases", []))
+    extra_terms = list(search_params.get("extra_terms", []))
+    allowed_domains = [item.lower() for item in search_params.get("allowed_domains", []) if str(item).strip()]
+    blocked_domains = [item.lower() for item in search_params.get("blocked_domains", []) if str(item).strip()]
+    max_results = min(max(int(search_params.get("max_results", 5)), 1), MAX_SEARCH_RESULTS)
+
+    if not entity_name:
+        raise ValueError("Укажите юридическое лицо для поиска интернет-упоминаний.")
+
+    report: Dict[str, Any] = {
+        "report_type": "internet",
+        "entity_name": entity_name,
+        "queries": [],
+        "search_errors": [],
+        "fetch_errors": [],
+        "rejected_pages": [],
+        "possible_pages": [],
+        "found_urls": 0,
+        "parsed_urls": 0,
+        "relevant_count": 0,
+        "possible_count": 0,
+        "rejected_count": 0,
+    }
+
+    queries = build_search_queries(entity_name, aliases, extra_terms)
+    report["queries"] = queries
+    search_results: List[Dict[str, str]] = []
+
+    for query in queries:
+        try:
+            for item in search_web(query, max_results):
+                item["query"] = query
+                search_results.append(item)
+        except Exception as error:
+            report["search_errors"].append(f"{query}: {error}")
+
+    unique_results: List[Dict[str, str]] = []
+    seen_urls: Set[str] = set()
+    for item in search_results:
+        url = str(item.get("url", "")).strip()
+        if not is_allowed_url(url, allowed_domains, blocked_domains):
+            continue
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        unique_results.append(item)
+        if len(unique_results) >= max_results:
+            break
+
+    report["found_urls"] = len(unique_results)
+    documents: List[Document] = []
+
+    for result in unique_results:
+        url = result.get("url", "").strip()
+        try:
+            page_payload = parse_html_page(fetch_url_text(url))
+            report["parsed_urls"] += 1
+        except (urllib_error.URLError, TimeoutError, ValueError) as error:
+            error_message = f"{url}: {error}"
+            report["fetch_errors"].append(error_message)
+            fallback_document = build_internet_document(
+                entity_name,
+                result.get("query", ""),
+                result,
+                {"title": result.get("title", ""), "description": result.get("snippet", ""), "published_at": "", "text": ""},
+                "possible",
+                [],
+                "unknown",
+                fetch_error=str(error),
+            )
+            report["possible_pages"].append(fallback_document["metadata"])
+            documents.append(fallback_document)
+            report["possible_count"] += 1
+            continue
+
+        match_status, matched_terms, language = evaluate_entity_match(
+            entity_name,
+            aliases,
+            extra_terms,
+            page_payload.get("title", ""),
+            page_payload.get("text", ""),
+            result.get("snippet", ""),
+            extract_domain(url),
+            allowed_domains,
+        )
+        document = build_internet_document(
+            entity_name,
+            result.get("query", ""),
+            result,
+            page_payload,
+            match_status,
+            matched_terms,
+            language,
+        )
+
+        if match_status == "relevant":
+            report["relevant_count"] += 1
+            documents.append(document)
+        elif match_status == "possible":
+            report["possible_count"] += 1
+            report["possible_pages"].append(document["metadata"])
+            documents.append(document)
+        else:
+            report["rejected_count"] += 1
+            report["rejected_pages"].append(document["metadata"])
+
+    return documents, report
+
+
 def extract_documents_from_upload(uploaded_file) -> List[Document]:
     """Нормализует загруженный файл в список документов, по одному на отзыв."""
     if uploaded_file is None:
@@ -310,19 +1256,27 @@ def extract_documents_from_upload(uploaded_file) -> List[Document]:
     )
 
 
-def collect_sources(text_input: str, uploaded_files) -> List[Document]:
+def collect_sources(text_input: str, uploaded_files, input_mode: str, source_params: Optional[Dict[str, Any]] = None) -> Tuple[List[Document], Dict[str, Any]]:
     """Собирает список документов для анализа в едином формате."""
+    if input_mode == "internet":
+        return collect_internet_mentions(source_params or {})
+    if input_mode == "news":
+        return collect_news_mentions(source_params or {})
+
     if uploaded_files:
         documents: List[Document] = []
         for uploaded_file in uploaded_files:
             documents.extend(extract_documents_from_upload(uploaded_file))
-        return documents
+        return documents, {}
 
-    return build_review_documents(
-        split_reviews_from_text(text_input),
-        "Текст из поля ввода",
-        "text_input",
-        metadata={"format": "text"},
+    return (
+        build_review_documents(
+            split_reviews_from_text(text_input),
+            "Текст из поля ввода",
+            "text_input",
+            metadata={"format": "text"},
+        ),
+        {},
     )
 
 def split_text_into_chunks(text: str, max_chars: int) -> List[str]:
@@ -1097,11 +2051,31 @@ def render_app_hero() -> None:
     )
 
 
-def render_input_sidebar(text_input: str, uploaded_files) -> None:
+def render_input_sidebar(text_input: str, uploaded_files, input_mode: str, source_params: Optional[Dict[str, Any]] = None) -> None:
     """Показывает сопроводительную панель рядом с вводом."""
     files_count = len(uploaded_files) if uploaded_files else 0
     char_count = len(text_input.strip())
-    text_state = "Готов к анализу" if text_input.strip() or files_count else "Ожидает данные"
+    source_params = source_params or {}
+    input_ready = text_input.strip() or files_count
+    if input_mode in ("internet", "news"):
+        input_ready = bool(str(source_params.get("entity_name", "")).strip())
+    text_state = "Готов к анализу" if input_ready else "Ожидает данные"
+    mode_label_map = {
+        "text": "Текст и файлы",
+        "internet": "Интернет-упоминания",
+        "news": "Новости",
+    }
+    mode_label = mode_label_map.get(input_mode, "Текст и файлы")
+    query_count = len(build_search_queries(
+        str(source_params.get("entity_name", "")),
+        list(source_params.get("aliases", [])),
+        list(source_params.get("extra_terms", [])),
+    )) if input_mode == "internet" else (1 if input_mode == "news" and str(source_params.get("entity_name", "")).strip() else 0)
+    mode_caption = "Форматы: TXT, MD, CSV, JSON"
+    if input_mode == "internet":
+        mode_caption = "Поиск + парсинг URL"
+    elif input_mode == "news":
+        mode_caption = "NewsAPI.org + анализ статей"
 
     st.markdown(
         f"""
@@ -1117,14 +2091,89 @@ def render_input_sidebar(text_input: str, uploaded_files) -> None:
                     <div class="micro-card__value">{files_count}</div>
                 </div>
             </div>
+            <div class="mini-grid" style="margin-top:0.8rem;">
+                <div class="micro-card">
+                    <div class="micro-card__label">Режим</div>
+                    <div class="micro-card__value" style="font-size:0.95rem;">{html.escape(mode_label)}</div>
+                </div>
+                <div class="micro-card">
+                    <div class="micro-card__label">Поисковых запросов</div>
+                    <div class="micro-card__value">{query_count}</div>
+                </div>
+            </div>
             <div class="chip-row">
                 <span class="ui-badge" style="background:{APP_PALETTE['accent_soft']};color:{APP_PALETTE['accent']};border-color:{APP_PALETTE['accent']}22;">{text_state}</span>
-                <span class="ui-badge" style="background:#f8fbff;color:{APP_PALETTE['muted']};border-color:{APP_PALETTE['border']};">Форматы: TXT, MD, CSV, JSON</span>
+                <span class="ui-badge" style="background:#f8fbff;color:{APP_PALETTE['muted']};border-color:{APP_PALETTE['border']};">{mode_caption}</span>
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_internet_collection_report(collection_report: Dict[str, Any]) -> None:
+    """Показывает метрики и проблемные страницы интернет-поиска."""
+    if not collection_report:
+        return
+
+    report_type = str(collection_report.get("report_type", "internet"))
+    title = "Интернет-источники" if report_type == "internet" else "Новостные источники"
+    found_label = "Найдено URL" if report_type == "internet" else "Найдено статей"
+    found_caption = "После дедупликации" if report_type == "internet" else "Получено из NewsAPI"
+    parsed_label = "Распарсено" if report_type == "internet" else "Подготовлено"
+    parsed_caption = "Страницы с извлеченным текстом" if report_type == "internet" else "Статей с доступным текстом"
+    rejected_caption = "Нерелевантные страницы" if report_type == "internet" else "Нерелевантные статьи"
+
+    with st.container(border=True):
+        st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
+        report_cols = st.columns(4)
+        with report_cols[0]:
+            st.markdown(render_metric_card(found_label, str(collection_report.get("found_urls", 0)), found_caption, "neutral"), unsafe_allow_html=True)
+        with report_cols[1]:
+            st.markdown(render_metric_card(parsed_label, str(collection_report.get("parsed_urls", 0)), parsed_caption, "positive"), unsafe_allow_html=True)
+        with report_cols[2]:
+            st.markdown(render_metric_card("Релевантные", str(collection_report.get("relevant_count", 0)), "Точные совпадения", "positive"), unsafe_allow_html=True)
+        with report_cols[3]:
+            st.markdown(render_metric_card("Отклонено", str(collection_report.get("rejected_count", 0)), rejected_caption, "negative"), unsafe_allow_html=True)
+
+        if collection_report.get("search_errors"):
+            st.markdown("**Ошибки поиска**")
+            for error_message in collection_report["search_errors"]:
+                st.info(error_message)
+
+        if collection_report.get("fetch_errors"):
+            st.markdown("**Ошибки получения страниц**")
+            for error_message in collection_report["fetch_errors"]:
+                st.info(error_message)
+
+        source_stats = collection_report.get("source_stats", {})
+        if isinstance(source_stats, dict) and source_stats:
+            st.markdown("**Топ источников**")
+            for source_name, count in source_stats.items():
+                st.markdown(f"- {source_name}: {count}")
+
+        if collection_report.get("possible_pages"):
+            st.markdown("**Сомнительные совпадения**")
+            for page in collection_report["possible_pages"][:5]:
+                url = str(page.get("url", "")).strip()
+                page_domain = str(page.get("source_name", "")).strip() or str(page.get("domain", "")).strip() or "источник"
+                matched_terms = ", ".join(page.get("matched_terms", [])) or "без явных маркеров"
+                line = f"- {page_domain}: {matched_terms}"
+                if url:
+                    st.markdown(f"{line}  \n[{url}]({url})")
+                else:
+                    st.markdown(line)
+
+        if collection_report.get("rejected_pages"):
+            st.markdown("**Отклоненные страницы**")
+            for page in collection_report["rejected_pages"][:5]:
+                url = str(page.get("url", "")).strip()
+                page_domain = str(page.get("source_name", "")).strip() or str(page.get("domain", "")).strip() or "источник"
+                title = str(page.get("search_title", "")).strip() or "Без заголовка"
+                if url:
+                    st.markdown(f"- {page_domain}: {html.escape(title)}  \n[{url}]({url})", unsafe_allow_html=False)
+                else:
+                    st.markdown(f"- {page_domain}: {title}")
 
 
 def analyze_document(document: Document) -> AnalysisResult:
@@ -1168,7 +2217,7 @@ def analyze_document(document: Document) -> AnalysisResult:
     }
 
 
-def render_summary_dashboard(analyses: List[AnalysisResult]) -> None:
+def render_summary_dashboard(analyses: List[AnalysisResult], collection_report: Optional[Dict[str, Any]] = None) -> None:
     """Отображает сводную аналитику по всем отзывам."""
     if not analyses:
         return
@@ -1272,6 +2321,9 @@ def render_summary_dashboard(analyses: List[AnalysisResult]) -> None:
                     unsafe_allow_html=True,
                 )
 
+    if collection_report:
+        render_internet_collection_report(collection_report)
+
 
 def render_analysis_card(analysis: AnalysisResult) -> None:
     """Отображает результаты анализа для одного документа."""
@@ -1291,20 +2343,37 @@ def render_analysis_card(analysis: AnalysisResult) -> None:
     top_emotion = analysis.get("emotions", [{}])[0].get("label", "Нет данных") if analysis.get("emotions") else "Нет данных"
     top_topic = analysis.get("topics", [{}])[0].get("label", "Нет данных") if analysis.get("topics") else "Нет данных"
     sentiment_score = float(sentiment.get("score", 0.0)) if sentiment else 0.0
+    status_map = {
+        "relevant": "Точное совпадение",
+        "possible": "Сомнительное совпадение",
+        "rejected": "Отклонено",
+    }
 
     with st.container(border=True):
-        st.markdown(
-            f"""
-            <div class="fade-in" style="display:flex;justify-content:space-between;gap:1rem;align-items:flex-start;margin-bottom:0.8rem;">
-                <div>
-                    <div class="section-title" style="margin-bottom:0.2rem;">{html.escape(source_name)}</div>
-                    <div class="section-text">Формат: {html.escape(str(metadata.get('format', source_type)))}</div>
-                </div>
-                <div>{render_badge(sentiment_ui['label'], bucket)}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        header_col, badge_col = st.columns([0.82, 0.18], gap="small")
+        with header_col:
+            st.markdown(
+                f"<div class='section-title' style='margin-bottom:0.2rem;'>{html.escape(source_name)}</div>",
+                unsafe_allow_html=True,
+            )
+            st.markdown(
+                f"<div class='section-text'>Формат: {html.escape(str(metadata.get('format', source_type)))}</div>",
+                unsafe_allow_html=True,
+            )
+            if source_type in ("internet_mention", "news_mention"):
+                url = str(metadata.get("url", "")).strip()
+                domain = str(metadata.get("source_name", "")).strip() or str(metadata.get("domain", "")).strip() or "Неизвестный домен"
+                published_at = str(metadata.get("published_at", "")).strip() or "Дата не найдена"
+                match_status = str(metadata.get("match_status", "")).strip() or "unknown"
+                matched_terms = ", ".join(metadata.get("matched_terms", [])) or "без явных совпадений"
+                st.caption(f"Источник: {domain}")
+                st.caption(f"Дата: {published_at}")
+                st.caption(f"Статус: {status_map.get(match_status, match_status)}")
+                st.caption(f"Совпадения: {matched_terms}")
+                if url:
+                    st.markdown(f"[Открыть источник]({url})")
+        with badge_col:
+            st.markdown(render_badge(sentiment_ui["label"], bucket), unsafe_allow_html=True)
 
         metric_cols = st.columns(3)
         with metric_cols[0]:
@@ -1366,28 +2435,138 @@ def main() -> None:
     st.markdown(get_custom_css(), unsafe_allow_html=True)
     render_app_hero()
 
+    text_input = ""
+    uploaded_files = []
+    source_params: Dict[str, Any] = {}
+
     input_col, support_col = st.columns([1.22, 0.78], gap="medium")
     with input_col:
         with st.container(border=True):
             st.markdown("<div class='section-title'>Ввод данных</div>", unsafe_allow_html=True)
-            text_input = st.text_area(
-                "Введите текст",
-                height=260,
-                placeholder="Один отзыв на блок. Для нескольких отзывов используйте разделитель ---",
-                label_visibility="visible",
-                help="TXT/MD: один отзыв на блок, разделитель --- или пустая строка.",
+            input_mode = st.radio(
+                "Источник данных",
+                options=["Текст и файлы", "Интернет-упоминания", "Новости"],
+                horizontal=True,
             )
-            uploaded_files = st.file_uploader(
-                "Загрузите один или несколько файлов",
-                type=["txt", "md", "csv", "json"],
-                accept_multiple_files=True,
-                help="CSV: один отзыв в строке. JSON: массив reviews или список объектов с полем review/text/comment.",
-            )
+            if input_mode == "Текст и файлы":
+                text_input = st.text_area(
+                    "Введите текст",
+                    height=260,
+                    placeholder="Один отзыв на блок. Для нескольких отзывов используйте разделитель ---",
+                    label_visibility="visible",
+                    help="TXT/MD: один отзыв на блок, разделитель --- или пустая строка.",
+                )
+                uploaded_files = st.file_uploader(
+                    "Загрузите один или несколько файлов",
+                    type=["txt", "md", "csv", "json"],
+                    accept_multiple_files=True,
+                    help="CSV: один отзыв в строке. JSON: массив reviews или список объектов с полем review/text/comment.",
+                )
+            elif input_mode == "Интернет-упоминания":
+                entity_name = st.text_input(
+                    "Юридическое лицо",
+                    placeholder="Например: ООО Ромашка",
+                    help="Официальное название компании или ключевой вариант, который должен находиться на странице.",
+                )
+                aliases_raw = st.text_area(
+                    "Алиасы и варианты названия",
+                    height=90,
+                    placeholder="ООО Ромашка, Ромашка, Romashka LLC",
+                    help="Запятая или новая строка между вариантами.",
+                )
+                extra_terms_raw = st.text_input(
+                    "Дополнительные маркеры",
+                    placeholder="Москва, кофейня, inn 7701...",
+                    help="Необязательные слова, которые усиливают уверенность в совпадении.",
+                )
+                allowed_domains_raw = st.text_input(
+                    "Разрешенные домены",
+                    placeholder="vedomosti.ru, 2gis.ru",
+                    help="Если заполнено, парсинг будет ограничен только этими доменами.",
+                )
+                blocked_domains_raw = st.text_input(
+                    "Исключаемые домены",
+                    placeholder="youtube.com, vk.com",
+                    help="Необязательный список доменов, которые нужно пропускать.",
+                )
+                max_results = st.number_input(
+                    "Максимум результатов",
+                    min_value=1,
+                    max_value=MAX_SEARCH_RESULTS,
+                    value=5,
+                    step=1,
+                    help="Сколько URL брать в обработку после дедупликации.",
+                )
+                source_params = {
+                    "entity_name": entity_name,
+                    "aliases": split_comma_lines(aliases_raw),
+                    "extra_terms": split_comma_lines(extra_terms_raw),
+                    "allowed_domains": split_comma_lines(allowed_domains_raw),
+                    "blocked_domains": split_comma_lines(blocked_domains_raw),
+                    "max_results": int(max_results),
+                }
+            else:
+                entity_name = st.text_input(
+                    "Юридическое лицо",
+                    placeholder="Например: ЛАНИТ",
+                    help="Основное название компании для поиска по новостям.",
+                )
+                aliases_raw = st.text_area(
+                    "Алиасы и варианты названия",
+                    height=90,
+                    placeholder="ЛАНИТ, ГК ЛАНИТ, LANIT",
+                    help="Запятая или новая строка между вариантами.",
+                )
+                extra_terms_raw = st.text_input(
+                    "Дополнительные маркеры",
+                    placeholder="ИТ, интегратор, цифровизация",
+                    help="Слова для усиления релевантности статьи на этапе матчинга.",
+                )
+                language = st.selectbox(
+                    "Язык новостей",
+                    options=["ru", "en"],
+                    index=0,
+                    help="Фильтр языка на уровне NewsAPI.",
+                )
+                date_cols = st.columns(2)
+                with date_cols[0]:
+                    date_from = st.date_input("С даты", value=None, format="YYYY-MM-DD")
+                with date_cols[1]:
+                    date_to = st.date_input("По дату", value=None, format="YYYY-MM-DD")
+                allowed_sources_raw = st.text_input(
+                    "Разрешенные источники",
+                    placeholder="vedomosti, forbes, cnews.ru",
+                    help="Необязательный список source id или source name из NewsAPI.",
+                )
+                max_results = st.number_input(
+                    "Максимум результатов",
+                    min_value=1,
+                    max_value=NEWSAPI_MAX_RESULTS,
+                    value=10,
+                    step=1,
+                    help="Сколько статей запросить у NewsAPI.",
+                )
+                st.caption("Для режима новостей требуется переменная окружения NEWSAPI_API_KEY.")
+                source_params = {
+                    "entity_name": entity_name,
+                    "aliases": split_comma_lines(aliases_raw),
+                    "extra_terms": split_comma_lines(extra_terms_raw),
+                    "language": language,
+                    "date_from": date_from.isoformat() if date_from else "",
+                    "date_to": date_to.isoformat() if date_to else "",
+                    "allowed_sources": split_comma_lines(allowed_sources_raw),
+                    "max_results": int(max_results),
+                }
             analyze_trigger = st.button("Запустить анализ")
 
     with support_col:
         st.markdown("<div class='sidebar-stack'>", unsafe_allow_html=True)
-        render_input_sidebar(text_input, uploaded_files)
+        render_input_sidebar(
+            text_input,
+            uploaded_files,
+            "internet" if input_mode == "Интернет-упоминания" else ("news" if input_mode == "Новости" else "text"),
+            source_params,
+        )
         with st.container(border=True):
             st.markdown("<div class='section-title'>Шаги</div>", unsafe_allow_html=True)
             st.markdown(
@@ -1402,9 +2581,23 @@ def main() -> None:
 
     if analyze_trigger:
         try:
-            sources = collect_sources(text_input, uploaded_files)
+            sources, collection_report = collect_sources(
+                text_input,
+                uploaded_files,
+                "internet" if input_mode == "Интернет-упоминания" else ("news" if input_mode == "Новости" else "text"),
+                source_params,
+            )
             if not sources or all(not str(document.get("text", "")).strip() for document in sources):
-                st.warning("Не найден текст для анализа. Введите текст или загрузите файл.")
+                if input_mode == "Интернет-упоминания":
+                    st.warning("Не удалось найти релевантные интернет-упоминания. Проверьте название компании, доступ в интернет и ограничения по доменам.")
+                    if collection_report:
+                        render_internet_collection_report(collection_report)
+                elif input_mode == "Новости":
+                    st.warning("Не удалось найти релевантные новости. Проверьте название компании, NEWSAPI_API_KEY и фильтры по датам или источникам.")
+                    if collection_report:
+                        render_internet_collection_report(collection_report)
+                else:
+                    st.warning("Не найден текст для анализа. Введите текст или загрузите файл.")
                 return
 
             with st.spinner("Анализ..."):
@@ -1418,10 +2611,10 @@ def main() -> None:
                 st.markdown("<div class='section-anchor'></div>", unsafe_allow_html=True)
                 result_tabs = st.tabs(["Сводка", "Отзывы"])
                 with result_tabs[0]:
-                    render_summary_dashboard(analyses)
+                    render_summary_dashboard(analyses, collection_report)
                 with result_tabs[1]:
                     st.markdown(
-                        "<div class='section-title'>Отзывы</div>",
+                        "<div class='section-title'>Отзывы и упоминания</div>",
                         unsafe_allow_html=True,
                     )
                     for analysis in analyses:
